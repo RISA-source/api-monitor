@@ -2,6 +2,7 @@ package utils
 
 import (
 	"os"
+	"strconv"
 )
 
 type Config struct {
@@ -12,6 +13,8 @@ type Config struct {
 	JwtSecret    string
 	BaseURL      string
 	EmailFrom    string
+	DevMode      bool
+	MaxWorkers   int
 }
 
 func LoadConfig() Config {
@@ -23,6 +26,8 @@ func LoadConfig() Config {
 		JwtSecret:    getenv("JWT_SECRET", "dev-jwt-secret"),
 		BaseURL:      getenv("BASE_URL", "http://localhost:8080"),
 		EmailFrom:    getenv("EMAIL_FROM", "notify@appyeye.local"),
+		DevMode:      getenvBool("DEV_MODE", true),
+		MaxWorkers:   getenvInt("MAX_WORKERS", 3),
 	}
 }
 
@@ -32,4 +37,22 @@ func getenv(k, d string) string {
 		return d
 	}
 	return v
+}
+
+func getenvBool(k string, d bool) bool {
+	if v := os.Getenv(k); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return d
+}
+
+func getenvInt(k string, d int) int {
+	if v := os.Getenv(k); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
+		}
+	}
+	return d
 }

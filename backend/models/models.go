@@ -1,36 +1,74 @@
 package models
 
-import "time"
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"time"
+)
 
+// User model - simplified and optimized
 type User struct {
-	ID             int       `db:"id" json:"id"`
-	GitHubID       int64     `db:"github_id" json:"github_id"`
-	GitHubUsername string    `db:"github_username" json:"github_username"`
-	Email          string    `db:"email" json:"email"`
-	Name           string    `db:"name" json:"name"`
-	AvatarURL      string    `db:"avatar_url" json:"avatar_url"`
-	CreatedAt      time.Time `db:"created_at" json:"created_at"`
+	ID        int       `db:"id" json:"id"`
+	Email     string    `db:"email" json:"email"`
+	Username  string    `db:"username" json:"username"`
+	IsDevUser bool      `db:"is_dev_user" json:"is_dev_user"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
 }
 
+// API model - optimized for monitoring
 type API struct {
-	ID             int               `db:"id" json:"id"`
-	Name           string            `db:"name" json:"name"`
-	BaseURL        string            `db:"base_url" json:"base_url"`
-	EndpointPath   string            `db:"endpoint_path" json:"endpoint_path"`
-	Method         string            `db:"method" json:"method"`
-	Headers        map[string]string `db:"headers" json:"headers"`
-	AddedBy        int               `db:"added_by" json:"added_by"`
-	CreatedAt      time.Time         `db:"created_at" json:"created_at"`
-	LastChecked    *time.Time        `db:"last_checked" json:"last_checked"`
-	LastHash       *string           `db:"last_hash" json:"last_hash"`
-	LastSchemaHash *string           `db:"last_schema_hash" json:"last_schema_hash"`
+	ID               int             `db:"id" json:"id"`
+	Name             string          `db:"name" json:"name"`
+	URL              string          `db:"url" json:"url"`
+	Method           string          `db:"method" json:"method"`
+	Headers          Headers         `db:"headers" json:"headers"`
+	CheckInterval    int             `db:"check_interval" json:"check_interval"` // seconds
+	IsActive         bool            `db:"is_active" json:"is_active"`
+	UserID           int             `db:"user_id" json:"user_id"`
+	LastChecked      *time.Time      `db:"last_checked" json:"last_checked"`
+	LastResponseHash *string         `db:"last_response_hash" json:"last_response_hash"`
+	LastStatusCode   *int            `db:"last_status_code" json:"last_status_code"`
+	CreatedAt        time.Time       `db:"created_at" json:"created_at"`
 }
 
+// APIChange model - lightweight change tracking
 type APIChange struct {
 	ID         int       `db:"id" json:"id"`
-	ApiID      int       `db:"api_id" json:"api_id"`
+	APIID      int       `db:"api_id" json:"api_id"`
 	ChangeType string    `db:"change_type" json:"change_type"`
-	Severity   string    `db:"severity" json:"severity"`
-	Diff       string    `db:"diff_summary" json:"diff_summary"`
+	OldValue   *string   `db:"old_value" json:"old_value"`
+	NewValue   *string   `db:"new_value" json:"new_value"`
 	DetectedAt time.Time `db:"detected_at" json:"detected_at"`
+}
+
+// CheckQueue model for 3-phase crawler
+type CheckQueue struct {
+	ID           int        `db:"id" json:"id"`
+	APIID        int        `db:"api_id" json:"api_id"`
+	Priority     int        `db:"priority" json:"priority"`
+	ScheduledFor time.Time  `db:"scheduled_for" json:"scheduled_for"`
+	Status       string     `db:"status" json:"status"`
+	Attempts     int        `db:"attempts" json:"attempts"`
+	LastError    *string    `db:"last_error" json:"last_error"`
+	CreatedAt    time.Time  `db:"created_at" json:"created_at"`
+	CompletedAt  *time.Time `db:"completed_at" json:"completed_at"`
+}
+
+// Headers type for JSONB field
+type Headers map[string]string
+
+func (h Headers) Value() (driver.Value, error) {
+	return json.Marshal(h)
+}
+
+func (h *Headers) Scan(value interface{}) error {
+	if value == nil {
+		*h = make(Headers)
+		return nil
+	}
+	b, ok := value.([]byte)
+	if !ok {
+		return nil
+	}
+	return json.Unmarshal(b, h)
 }
