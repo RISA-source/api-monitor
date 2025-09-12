@@ -8,26 +8,32 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
-	"api-monitor/backend/db"
 	"api-monitor/backend/models"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/rs/zerolog/log"
 )
 
-// OptimizedCrawler implements a 3-phase approach for efficient crawling
-type OptimizedCrawler struct {
-	db          *sqlx.DB
-	httpClient  *http.Client
-	workerPool  chan struct{} // Limits concurrent workers
-	cache       *SimpleCache  // In-memory cache
-	rateLimiter *RateLimiter
+// SchemaExtractor interface for schema hash
+type SchemaExtractor interface {
+	ExtractSimpleSchema(interface{}) interface{}
 }
 
-// SimpleCache for reducing database queries
+// Crawler is a robust, 3-phase API monitoring crawler
+type Crawler struct {
+	db           *sqlx.DB
+	httpClient   *http.Client
+	workerPool   chan struct{}
+	cache        *SimpleCache
+	rateLimiter  *RateLimiter
+	schemaHelper SchemaExtractor
+}
+
+// SimpleCache reduces DB queries
 type SimpleCache struct {
 	mu    sync.RWMutex
 	items map[string]cacheItem
@@ -38,35 +44,34 @@ type cacheItem struct {
 	expiresAt time.Time
 }
 
-// RateLimiter to prevent overwhelming APIs
+// RateLimiter prevents overwhelming APIs
 type RateLimiter struct {
 	mu       sync.Mutex
-	limits   map[string]time.Time // domain -> next allowed time
+	limits   map[string]time.Time
 	interval time.Duration
 }
 
-func NewOptimizedCrawler(database *sqlx.DB) *OptimizedCrawler {
-	return &OptimizedCrawler{
-		db: database,
+func NewCrawler(db *sqlx.DB, extractor SchemaExtractor) *Crawler {
+	c := &Crawler{
+		db: db,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
-				MaxIdleConns:        10,
-				MaxIdleConnsPerHost: 2,
+				MaxIdleConns:        20,
+				MaxIdleConnsPerHost: 5,
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		workerPool:  make(chan struct{}, 3), // Max 3 concurrent workers
-		cache:       NewSimpleCache(),
-		rateLimiter: NewRateLimiter(2 * time.Second), // 2 seconds between requests to same domain
+		workerPool:   make(chan struct{}, 5), // max 5 concurrent
+		cache:        NewSimpleCache(),
+		rateLimiter:  NewRateLimiter(2 * time.Second),
+		schemaHelper: extractor,
 	}
+	return c
 }
 
 func NewSimpleCache() *SimpleCache {
-	cache := &SimpleCache{
-		items: make(map[string]cacheItem),
-	}
-	// Cleanup expired items every 5 minutes
+	cache := &SimpleCache{items: make(map[string]cacheItem)}
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		for range ticker.C {
@@ -99,9 +104,9 @@ func (c *SimpleCache) cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
-	for key, item := range c.items {
+	for k, item := range c.items {
 		if now.After(item.expiresAt) {
-			delete(c.items, key)
+			delete(c.items, k)
 		}
 	}
 }
@@ -115,38 +120,36 @@ func NewRateLimiter(interval time.Duration) *RateLimiter {
 
 func (r *RateLimiter) Wait(domain string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	
-	if next, exists := r.limits[domain]; exists {
-		if wait := time.Until(next); wait > 0 {
+	next, exists := r.limits[domain]
+	r.mu.Unlock()
+
+	if exists {
+		wait := time.Until(next)
+		if wait > 0 {
 			time.Sleep(wait)
 		}
 	}
+
+	r.mu.Lock()
 	r.limits[domain] = time.Now().Add(r.interval)
+	r.mu.Unlock()
 }
 
-// Start begins the 3-phase crawler
-func (c *OptimizedCrawler) Start(ctx context.Context) {
-	log.Info().Msg("Starting optimized 3-phase crawler")
-	
-	// Phase 1: Queue builder (every 5 minutes)
+// Start runs the crawler: 3 phases
+func (c *Crawler) Start(ctx context.Context) {
+	log.Info().Msg("Starting crawler")
+
 	go c.runPhase1(ctx)
-	
-	// Phase 2: Queue processor (continuous)
 	go c.runPhase2(ctx)
-	
-	// Phase 3: Cleanup and optimization (every hour)
 	go c.runPhase3(ctx)
 }
 
-// Phase 1: Build check queue based on intervals
-func (c *OptimizedCrawler) runPhase1(ctx context.Context) {
+// Phase1: Build queue
+func (c *Crawler) runPhase1(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	
-	// Initial run
+
 	c.buildQueue()
-	
 	for {
 		select {
 		case <-ctx.Done():
@@ -157,50 +160,47 @@ func (c *OptimizedCrawler) runPhase1(ctx context.Context) {
 	}
 }
 
-func (c *OptimizedCrawler) buildQueue() {
+func (c *Crawler) buildQueue() {
 	query := `
-		INSERT INTO check_queue (api_id, priority, scheduled_for)
-		SELECT 
-			id,
-			CASE 
-				WHEN check_interval <= 300 THEN 1  -- 5 min or less = high priority
-				WHEN check_interval <= 3600 THEN 5  -- 1 hour or less = medium
-				ELSE 8  -- low priority
-			END as priority,
-			COALESCE(last_checked, CURRENT_TIMESTAMP) + (check_interval || ' seconds')::INTERVAL as scheduled_for
-		FROM apis
-		WHERE is_active = true
-		AND (last_checked IS NULL 
-			OR last_checked + (check_interval || ' seconds')::INTERVAL <= CURRENT_TIMESTAMP)
-		ON CONFLICT DO NOTHING`
-	
-	result, err := c.db.Exec(query)
+	INSERT INTO check_queue (api_id, priority, scheduled_for)
+	SELECT 
+		id,
+		CASE 
+			WHEN check_interval <= 300 THEN 1
+			WHEN check_interval <= 3600 THEN 5
+			ELSE 8
+		END as priority,
+		COALESCE(last_checked, CURRENT_TIMESTAMP) + (check_interval || ' seconds')::INTERVAL as scheduled_for
+	FROM apis
+	WHERE is_active = true
+	AND (last_checked IS NULL OR last_checked + (check_interval || ' seconds')::INTERVAL <= CURRENT_TIMESTAMP)
+	ON CONFLICT DO NOTHING`
+
+	res, err := c.db.Exec(query)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to build queue")
+		log.Error().Err(err).Msg("buildQueue failed")
 		return
 	}
-	
-	rows, _ := result.RowsAffected()
+	rows, _ := res.RowsAffected()
 	if rows > 0 {
-		log.Info().Int64("count", rows).Msg("Added APIs to check queue")
+		log.Info().Int64("count", rows).Msg("APIs added to queue")
 	}
 }
 
-// Phase 2: Process the queue
-func (c *OptimizedCrawler) runPhase2(ctx context.Context) {
+// Phase2: Process queue
+func (c *Crawler) runPhase2(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 			c.processQueue()
-			time.Sleep(5 * time.Second) // Small delay between batches
+			time.Sleep(3 * time.Second)
 		}
 	}
 }
 
-func (c *OptimizedCrawler) processQueue() {
-	// Fetch batch of pending checks
+func (c *Crawler) processQueue() {
 	var queue []models.CheckQueue
 	err := c.db.Select(&queue, `
 		SELECT * FROM check_queue 
@@ -209,157 +209,138 @@ func (c *OptimizedCrawler) processQueue() {
 		ORDER BY priority, scheduled_for
 		LIMIT 10
 		FOR UPDATE SKIP LOCKED`)
-	
 	if err != nil || len(queue) == 0 {
 		return
 	}
-	
-	// Mark as processing
+
 	ids := make([]int, len(queue))
 	for i, q := range queue {
 		ids[i] = q.ID
 	}
-	
-	query, args, _ := sqlx.In(`UPDATE check_queue SET status = 'processing' WHERE id IN (?)`, ids)
+	query, args, _ := sqlx.In(`UPDATE check_queue SET status='processing' WHERE id IN (?)`, ids)
 	query = c.db.Rebind(query)
 	c.db.Exec(query, args...)
-	
-	// Process each check
+
 	var wg sync.WaitGroup
-	for _, check := range queue {
+	for _, q := range queue {
 		wg.Add(1)
-		c.workerPool <- struct{}{} // Acquire worker slot
-		
-		go func(q models.CheckQueue) {
-			defer func() {
-				<-c.workerPool // Release worker slot
-				wg.Done()
-			}()
-			
-			c.checkAPI(q)
-		}(check)
+		c.workerPool <- struct{}{}
+		go func(check models.CheckQueue) {
+			defer wg.Done()
+			defer func() { <-c.workerPool }()
+			c.checkAPI(check)
+		}(q)
 	}
-	
 	wg.Wait()
 }
 
-func (c *OptimizedCrawler) checkAPI(queue models.CheckQueue) {
-	// Get API details
+func (c *Crawler) checkAPI(queue models.CheckQueue) {
 	var api models.API
-	err := c.db.Get(&api, "SELECT * FROM apis WHERE id = $1", queue.APIID)
+	err := c.db.Get(&api, "SELECT * FROM apis WHERE id=$1", queue.APIID)
 	if err != nil {
 		c.updateQueueStatus(queue.ID, "failed", fmt.Sprintf("API not found: %v", err))
 		return
 	}
-	
-	// Apply rate limiting
+
 	domain := extractDomain(api.URL)
 	c.rateLimiter.Wait(domain)
-	
-	// Make HTTP request
+
 	req, err := http.NewRequest(api.Method, api.URL, nil)
 	if err != nil {
-		c.updateQueueStatus(queue.ID, "failed", fmt.Sprintf("Invalid request: %v", err))
+		c.updateQueueStatus(queue.ID, "failed", fmt.Sprintf("invalid request: %v", err))
 		return
 	}
-	
-	// Add headers
 	for k, v := range api.Headers {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("User-Agent", "AppyEye-Monitor/1.0")
-	
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.updateQueueStatus(queue.ID, "failed", fmt.Sprintf("Request failed: %v", err))
+		c.updateQueueStatus(queue.ID, "failed", fmt.Sprintf("request failed: %v", err))
 		c.recordChange(api, "error", nil, &err.Error())
 		return
 	}
 	defer resp.Body.Close()
-	
-	// Read response (limited to 1MB to save memory)
+
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
-		c.updateQueueStatus(queue.ID, "failed", fmt.Sprintf("Read failed: %v", err))
+		c.updateQueueStatus(queue.ID, "failed", fmt.Sprintf("read failed: %v", err))
 		return
 	}
-	
-	// Calculate hash
+
 	hash := sha256.Sum256(body)
 	hashStr := hex.EncodeToString(hash[:])
-	
-	// Check for changes
+
+	// JSON schema hash
+	schemaHash := ""
+	var jsonObj interface{}
+	if json.Unmarshal(body, &jsonObj) == nil {
+		schema := c.schemaHelper.ExtractSimpleSchema(jsonObj)
+		if sb, err := json.Marshal(schema); err == nil {
+			sh := sha256.Sum256(sb)
+			schemaHash = hex.EncodeToString(sh[:])
+		}
+	}
+
 	changed := false
-	if api.LastResponseHash != nil && *api.LastResponseHash != hashStr {
-		changed = true
+	if api.LastResponseHash == nil || *api.LastResponseHash != hashStr {
 		c.recordChange(api, "response_change", api.LastResponseHash, &hashStr)
-	}
-	
-	if api.LastStatusCode != nil && *api.LastStatusCode != resp.StatusCode {
 		changed = true
-		oldStatus := fmt.Sprintf("%d", *api.LastStatusCode)
-		newStatus := fmt.Sprintf("%d", resp.StatusCode)
-		c.recordChange(api, "status_change", &oldStatus, &newStatus)
 	}
-	
-	// Update API record
+	if api.LastSchemaHash == nil || *api.LastSchemaHash != schemaHash {
+		c.recordChange(api, "schema_change", api.LastSchemaHash, &schemaHash)
+		changed = true
+	}
+	statusStr := fmt.Sprintf("%d", resp.StatusCode)
+	if api.LastStatusCode == nil || *api.LastStatusCode != resp.StatusCode {
+		c.recordChange(api, "status_change", api.LastStatusCode, &statusStr)
+		changed = true
+	}
+
 	_, err = c.db.Exec(`
-		UPDATE apis 
-		SET last_checked = CURRENT_TIMESTAMP,
-		    last_response_hash = $1,
-		    last_status_code = $2
-		WHERE id = $3`,
-		hashStr, resp.StatusCode, api.ID)
-	
+		UPDATE apis SET last_checked=CURRENT_TIMESTAMP, 
+		last_response_hash=$1, last_status_code=$2, last_schema_hash=$3 
+		WHERE id=$4`, hashStr, resp.StatusCode, schemaHash, api.ID)
 	if err != nil {
-		log.Error().Err(err).Int("api_id", api.ID).Msg("Failed to update API")
+		log.Error().Err(err).Int("api_id", api.ID).Msg("update failed")
 	}
-	
-	// Mark queue item as completed
+
 	c.updateQueueStatus(queue.ID, "completed", "")
-	
+
 	if changed {
 		log.Info().Int("api_id", api.ID).Str("api_name", api.Name).Msg("Change detected")
 	}
 }
 
-func (c *OptimizedCrawler) recordChange(api models.API, changeType string, oldValue, newValue *string) {
+func (c *Crawler) recordChange(api models.API, changeType string, oldVal, newVal *string) {
 	_, err := c.db.Exec(`
 		INSERT INTO api_changes (api_id, change_type, old_value, new_value)
-		VALUES ($1, $2, $3, $4)`,
-		api.ID, changeType, oldValue, newValue)
-	
+		VALUES ($1,$2,$3,$4)`, api.ID, changeType, oldVal, newVal)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to record change")
+		log.Error().Err(err).Msg("recordChange failed")
 	}
 }
 
-func (c *OptimizedCrawler) updateQueueStatus(queueID int, status string, errorMsg string) {
+func (c *Crawler) updateQueueStatus(queueID int, status, errMsg string) {
 	var err error
 	if status == "completed" {
 		_, err = c.db.Exec(`
-			UPDATE check_queue 
-			SET status = $1, completed_at = CURRENT_TIMESTAMP
-			WHERE id = $2`,
-			status, queueID)
-	} else if status == "failed" {
+			UPDATE check_queue SET status=$1, completed_at=CURRENT_TIMESTAMP WHERE id=$2`, status, queueID)
+	} else {
 		_, err = c.db.Exec(`
-			UPDATE check_queue 
-			SET status = $1, last_error = $2, attempts = attempts + 1
-			WHERE id = $3`,
-			status, errorMsg, queueID)
+			UPDATE check_queue SET status=$1, last_error=$2, attempts=attempts+1 WHERE id=$3`, status, errMsg, queueID)
 	}
-	
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to update queue status")
+		log.Error().Err(err).Msg("updateQueueStatus failed")
 	}
 }
 
-// Phase 3: Cleanup old data
-func (c *OptimizedCrawler) runPhase3(ctx context.Context) {
+// Phase3: Cleanup
+func (c *Crawler) runPhase3(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -370,60 +351,26 @@ func (c *OptimizedCrawler) runPhase3(ctx context.Context) {
 	}
 }
 
-func (c *OptimizedCrawler) cleanup() {
-	// Remove old completed queue items
-	_, err := c.db.Exec(`
-		DELETE FROM check_queue 
-		WHERE status = 'completed' 
-		AND completed_at < CURRENT_TIMESTAMP - INTERVAL '24 hours'`)
-	
+func (c *Crawler) cleanup() {
+	_, err := c.db.Exec(`DELETE FROM check_queue WHERE status='completed' AND completed_at<CURRENT_TIMESTAMP-INTERVAL '24 hours'`)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to cleanup queue")
+		log.Error().Err(err).Msg("cleanup failed")
 	}
-	
-	// Reset failed items for retry
-	_, err = c.db.Exec(`
-		UPDATE check_queue 
-		SET status = 'pending', attempts = 0
-		WHERE status = 'failed' 
-		AND attempts < 3
-		AND created_at > CURRENT_TIMESTAMP - INTERVAL '1 hour'`)
-	
+	_, err = c.db.Exec(`UPDATE check_queue SET status='pending', attempts=0 WHERE status='failed' AND attempts<3 AND created_at>CURRENT_TIMESTAMP-INTERVAL '1 hour'`)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to reset failed items")
+		log.Error().Err(err).Msg("reset failed items failed")
 	}
-	
-	// Archive old changes (keep only last 30 days)
-	_, err = c.db.Exec(`
-		DELETE FROM api_changes 
-		WHERE detected_at < CURRENT_TIMESTAMP - INTERVAL '30 days'`)
-	
+	_, err = c.db.Exec(`DELETE FROM api_changes WHERE detected_at<CURRENT_TIMESTAMP-INTERVAL '30 days'`)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to archive old changes")
+		log.Error().Err(err).Msg("archive old changes failed")
 	}
-	
 	log.Info().Msg("Cleanup completed")
 }
 
-// Helper function to extract domain from URL
 func extractDomain(urlStr string) string {
-	// Simple domain extraction - can be improved
-	if len(urlStr) > 8 {
-		start := 0
-		if urlStr[:7] == "http://" {
-			start = 7
-		} else if urlStr[:8] == "https://" {
-			start = 8
-		}
-		
-		end := len(urlStr)
-		for i := start; i < len(urlStr); i++ {
-			if urlStr[i] == '/' || urlStr[i] == ':' {
-				end = i
-				break
-			}
-		}
-		return urlStr[start:end]
+	u, err := url.Parse(urlStr)
+	if err != nil {
+		return urlStr
 	}
-	return urlStr
+	return u.Hostname()
 }
