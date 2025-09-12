@@ -1,1 +1,17 @@
+PORT=8080
 
+# Neon/Postgres connection (replace with Neon credentials)
+DATABASE_URL==postgresql://<your-neon-connection-string>
+
+# GitHub OAuth (same)
+GITHUB_KEY=api_client
+GITHUB_SECRET=api_secret
+
+# JWT secret (keep the same)
+JWT_SECRET=supersecretjwtkey
+
+# Cloud Run URL after deployment
+BASE_URL=https://YOUR_CLOUD_RUN_SERVICE_URL
+
+EMAIL_FROM=notify@appyeye.local
+RESEND_API_KEY=your_api_key_if_used
