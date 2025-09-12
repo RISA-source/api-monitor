@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -16,18 +17,37 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// GzipMiddleware compresses responses
+// ApiResponse is a consistent JSON response
+type ApiResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+// JSONResponse writes a standardized JSON response
+func JSONResponse(w http.ResponseWriter, status int, data interface{}, errMsg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(ApiResponse{
+		Success: status >= 200 && status < 300,
+		Data:    data,
+		Error:   errMsg,
+	})
+}
+
+// ---------------- GZIP Middleware ----------------
 func GzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Vary", "Accept-Encoding") // ensures caching works
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
 		}
-		
+
 		w.Header().Set("Content-Encoding", "gzip")
 		gz := gzip.NewWriter(w)
 		defer gz.Close()
-		
+
 		gzw := gzipResponseWriter{Writer: gz, ResponseWriter: w}
 		next.ServeHTTP(gzw, r)
 	})
@@ -42,35 +62,40 @@ func (w gzipResponseWriter) Write(b []byte) (int, error) {
 	return w.Writer.Write(b)
 }
 
-// DevAuthMiddleware - Simple auth for development
+// ---------------- Dev Auth Middleware ----------------
 func DevAuthMiddleware(cfg utils.Config) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if cfg.DevMode {
-				// In dev mode, auto-authenticate as dev user
 				r = r.WithContext(setUserContext(r.Context(), 1)) // Dev user ID = 1
 				next.ServeHTTP(w, r)
 				return
 			}
-			
-			// In production, use JWT auth
 			JWTMiddleware(next).ServeHTTP(w, r)
 		})
 	}
 }
 
-// ListAPIsHandlerV2 - Optimized list with pagination
+// ---------------- API Handlers ----------------
+
+// ListAPIsHandlerV2 - paginated
 func ListAPIsHandlerV2(w http.ResponseWriter, r *http.Request) {
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
+	page := 1
+	if pStr := r.URL.Query().Get("page"); pStr != "" {
+		if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+			page = p
+		}
 	}
 	limit := 20
+	if lStr := r.URL.Query().Get("limit"); lStr != "" {
+		if l, err := strconv.Atoi(lStr); err == nil && l > 0 && l <= 100 {
+			limit = l
+		}
+	}
 	offset := (page - 1) * limit
-	
-	// Get user ID from context (0 for public)
+
 	userID := getUserFromContext(r.Context())
-	
+
 	query := `
 		SELECT id, name, url, method, check_interval, is_active, 
 		       last_checked, last_status_code, created_at
@@ -78,30 +103,32 @@ func ListAPIsHandlerV2(w http.ResponseWriter, r *http.Request) {
 		WHERE ($1 = 0 OR user_id = $1)
 		ORDER BY created_at DESC
 		LIMIT $2 OFFSET $3`
-	
+
 	var apis []models.API
-	err := db.DB.Select(&apis, query, userID, limit, offset)
-	if err != nil {
-		http.Error(w, "Failed to fetch APIs", http.StatusInternalServerError)
+	if err := db.DB.Select(&apis, query, userID, limit, offset); err != nil {
+		log.Error().Err(err).Msg("Failed to fetch APIs")
+		JSONResponse(w, http.StatusInternalServerError, nil, "Failed to fetch APIs")
 		return
 	}
-	
-	// Get total count for pagination
+
 	var total int
-	db.DB.Get(&total, "SELECT COUNT(*) FROM apis WHERE ($1 = 0 OR user_id = $1)", userID)
-	
-	response := map[string]interface{}{
+	if err := db.DB.Get(&total, "SELECT COUNT(*) FROM apis WHERE ($1 = 0 OR user_id = $1)", userID); err != nil {
+		log.Error().Err(err).Msg("Failed to count APIs")
+		JSONResponse(w, http.StatusInternalServerError, nil, "Failed to fetch API count")
+		return
+	}
+
+	resp := map[string]interface{}{
 		"apis":       apis,
 		"page":       page,
 		"total":      total,
 		"totalPages": (total + limit - 1) / limit,
 	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+
+	JSONResponse(w, http.StatusOK, resp, "")
 }
 
-// CreateAPIHandlerV2 - Simplified API creation
+// CreateAPIHandlerV2 - create API
 func CreateAPIHandlerV2(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name          string            `json:"name"`
@@ -110,307 +137,280 @@ func CreateAPIHandlerV2(w http.ResponseWriter, r *http.Request) {
 		Headers       map[string]string `json:"headers"`
 		CheckInterval int               `json:"check_interval"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "Invalid request body")
 		return
 	}
-	
-	// Validate
+
 	if req.Name == "" || req.URL == "" {
-		http.Error(w, "Name and URL are required", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "Name and URL required")
 		return
 	}
-	
+
 	if req.Method == "" {
 		req.Method = "GET"
 	}
-	
 	if req.CheckInterval == 0 {
-		req.CheckInterval = 3600 // Default 1 hour
+		req.CheckInterval = 3600
 	}
-	
+
 	userID := getUserFromContext(r.Context())
-	
-	// Insert API
+
+	headersJSON, err := json.Marshal(req.Headers)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to marshal headers")
+		JSONResponse(w, http.StatusInternalServerError, nil, "Failed to process headers")
+		return
+	}
+
 	query := `
 		INSERT INTO apis (name, url, method, headers, check_interval, user_id, is_active)
 		VALUES ($1, $2, $3, $4, $5, $6, true)
 		RETURNING id, created_at`
-	
+
 	var apiID int
 	var createdAt time.Time
-	
-	headers, _ := json.Marshal(req.Headers)
-	err := db.DB.QueryRow(query, req.Name, req.URL, req.Method, headers, req.CheckInterval, userID).
-		Scan(&apiID, &createdAt)
-	
-	if err != nil {
+	if err := db.DB.QueryRow(query, req.Name, req.URL, req.Method, headersJSON, req.CheckInterval, userID).
+		Scan(&apiID, &createdAt); err != nil {
+		log.Error().Err(err).Msg("Failed to create API")
 		if strings.Contains(err.Error(), "unique") {
-			http.Error(w, "API already exists", http.StatusConflict)
+			JSONResponse(w, http.StatusConflict, nil, "API already exists")
 		} else {
-			log.Error().Err(err).Msg("Failed to create API")
-			http.Error(w, "Failed to create API", http.StatusInternalServerError)
+			JSONResponse(w, http.StatusInternalServerError, nil, "Failed to create API")
 		}
 		return
 	}
-	
+
 	// Schedule first check
-	scheduleQuery := `
-		INSERT INTO check_queue (api_id, priority, scheduled_for)
-		VALUES ($1, 1, CURRENT_TIMESTAMP)`
-	db.DB.Exec(scheduleQuery, apiID)
-	
-	response := map[string]interface{}{
+	_, _ = db.DB.Exec("INSERT INTO check_queue (api_id, priority, scheduled_for) VALUES ($1, 1, CURRENT_TIMESTAMP)", apiID)
+
+	resp := map[string]interface{}{
 		"id":         apiID,
 		"name":       req.Name,
 		"url":        req.URL,
 		"created_at": createdAt,
 	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(response)
+
+	JSONResponse(w, http.StatusCreated, resp, "")
 }
 
-// GetAPIDetailsV2 - Get API with recent changes
+// GetAPIDetailsV2 - fetch API + recent changes
 func GetAPIDetailsV2(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	apiID, err := strconv.Atoi(vars["id"])
 	if err != nil {
-		http.Error(w, "Invalid API ID", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "Invalid API ID")
 		return
 	}
-	
 	userID := getUserFromContext(r.Context())
-	
-	// Get API details
+
 	var api models.API
-	err = db.DB.Get(&api, `
-		SELECT * FROM apis 
-		WHERE id = $1 AND ($2 = 0 OR user_id = $2)`, 
-		apiID, userID)
-	
-	if err != nil {
-		http.Error(w, "API not found", http.StatusNotFound)
+	if err := db.DB.Get(&api, "SELECT * FROM apis WHERE id=$1 AND ($2=0 OR user_id=$2)", apiID, userID); err != nil {
+		JSONResponse(w, http.StatusNotFound, nil, "API not found")
 		return
 	}
-	
-	// Get recent changes
+
 	var changes []models.APIChange
-	db.DB.Select(&changes, `
-		SELECT * FROM api_changes 
-		WHERE api_id = $1 
-		ORDER BY detected_at DESC 
-		LIMIT 10`, apiID)
-	
-	response := map[string]interface{}{
+	if err := db.DB.Select(&changes, "SELECT * FROM api_changes WHERE api_id=$1 ORDER BY detected_at DESC LIMIT 10", apiID); err != nil {
+		log.Error().Err(err).Msg("Failed to fetch API changes")
+	}
+
+	resp := map[string]interface{}{
 		"api":     api,
 		"changes": changes,
 	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	JSONResponse(w, http.StatusOK, resp, "")
 }
 
-// UpdateAPIHandlerV2 - Update API settings
+// UpdateAPIHandlerV2 - safe dynamic update
 func UpdateAPIHandlerV2(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	apiID, err := strconv.Atoi(vars["id"])
 	if err != nil {
-		http.Error(w, "Invalid API ID", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "Invalid API ID")
 		return
 	}
-	
+
 	var req struct {
 		Name          *string           `json:"name"`
 		CheckInterval *int              `json:"check_interval"`
 		IsActive      *bool             `json:"is_active"`
 		Headers       map[string]string `json:"headers"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "Invalid request body")
 		return
 	}
-	
+
 	userID := getUserFromContext(r.Context())
-	
-	// Build update query dynamically
+
 	updates := []string{}
 	args := []interface{}{}
 	argCount := 1
-	
+
 	if req.Name != nil {
-		updates = append(updates, "name = $"+strconv.Itoa(argCount))
+		updates = append(updates, "name=$"+strconv.Itoa(argCount))
 		args = append(args, *req.Name)
 		argCount++
 	}
-	
 	if req.CheckInterval != nil {
-		updates = append(updates, "check_interval = $"+strconv.Itoa(argCount))
+		updates = append(updates, "check_interval=$"+strconv.Itoa(argCount))
 		args = append(args, *req.CheckInterval)
 		argCount++
 	}
-	
 	if req.IsActive != nil {
-		updates = append(updates, "is_active = $"+strconv.Itoa(argCount))
+		updates = append(updates, "is_active=$"+strconv.Itoa(argCount))
 		args = append(args, *req.IsActive)
 		argCount++
 	}
-	
 	if req.Headers != nil {
-		headers, _ := json.Marshal(req.Headers)
-		updates = append(updates, "headers = $"+strconv.Itoa(argCount))
-		args = append(args, headers)
+		headersJSON, _ := json.Marshal(req.Headers)
+		updates = append(updates, "headers=$"+strconv.Itoa(argCount))
+		args = append(args, headersJSON)
 		argCount++
 	}
-	
+
 	if len(updates) == 0 {
-		http.Error(w, "No updates provided", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "No updates provided")
 		return
 	}
-	
-	// Add WHERE conditions
+
 	args = append(args, apiID, userID)
-	query := "UPDATE apis SET " + strings.Join(updates, ", ") + 
-		" WHERE id = $" + strconv.Itoa(argCount) + 
-		" AND user_id = $" + strconv.Itoa(argCount+1)
-	
+	query := "UPDATE apis SET " + strings.Join(updates, ", ") + " WHERE id=$" + strconv.Itoa(argCount) + " AND user_id=$" + strconv.Itoa(argCount+1)
+
 	result, err := db.DB.Exec(query, args...)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to update API")
-		http.Error(w, "Failed to update API", http.StatusInternalServerError)
+		JSONResponse(w, http.StatusInternalServerError, nil, "Failed to update API")
 		return
 	}
-	
+
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		http.Error(w, "API not found or unauthorized", http.StatusNotFound)
+		JSONResponse(w, http.StatusNotFound, nil, "API not found or unauthorized")
 		return
 	}
-	
-	w.WriteHeader(http.StatusNoContent)
+
+	JSONResponse(w, http.StatusNoContent, nil, "")
 }
 
-// DeleteAPIHandlerV2 - Delete API and related data
+// DeleteAPIHandlerV2 - delete API + queue
 func DeleteAPIHandlerV2(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	apiID, err := strconv.Atoi(vars["id"])
 	if err != nil {
-		http.Error(w, "Invalid API ID", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "Invalid API ID")
 		return
 	}
-	
 	userID := getUserFromContext(r.Context())
-	
-	result, err := db.DB.Exec(`
-		DELETE FROM apis 
-		WHERE id = $1 AND user_id = $2`, 
-		apiID, userID)
-	
+
+	result, err := db.DB.Exec("DELETE FROM apis WHERE id=$1 AND user_id=$2", apiID, userID)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to delete API")
-		http.Error(w, "Failed to delete API", http.StatusInternalServerError)
+		JSONResponse(w, http.StatusInternalServerError, nil, "Failed to delete API")
 		return
 	}
-	
+
 	rows, _ := result.RowsAffected()
 	if rows == 0 {
-		http.Error(w, "API not found or unauthorized", http.StatusNotFound)
+		JSONResponse(w, http.StatusNotFound, nil, "API not found or unauthorized")
 		return
 	}
-	
-	w.WriteHeader(http.StatusNoContent)
+
+	JSONResponse(w, http.StatusNoContent, nil, "")
 }
 
-// GetAPIChangesV2 - Get paginated changes for an API
+// GetAPIChangesV2 - paginated changes
 func GetAPIChangesV2(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	apiID, err := strconv.Atoi(vars["id"])
 	if err != nil {
-		http.Error(w, "Invalid API ID", http.StatusBadRequest)
+		JSONResponse(w, http.StatusBadRequest, nil, "Invalid API ID")
 		return
 	}
-	
-	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
-	if page < 1 {
-		page = 1
+
+	page := 1
+	if pStr := r.URL.Query().Get("page"); pStr != "" {
+		if p, err := strconv.Atoi(pStr); err == nil && p > 0 {
+			page = p
+		}
 	}
 	limit := 50
 	offset := (page - 1) * limit
-	
+
 	var changes []models.APIChange
-	err = db.DB.Select(&changes, `
-		SELECT * FROM api_changes 
-		WHERE api_id = $1 
-		ORDER BY detected_at DESC
-		LIMIT $2 OFFSET $3`, 
-		apiID, limit, offset)
-	
-	if err != nil {
-		http.Error(w, "Failed to fetch changes", http.StatusInternalServerError)
+	if err := db.DB.Select(&changes, "SELECT * FROM api_changes WHERE api_id=$1 ORDER BY detected_at DESC LIMIT $2 OFFSET $3", apiID, limit, offset); err != nil {
+		log.Error().Err(err).Msg("Failed to fetch API changes")
+		JSONResponse(w, http.StatusInternalServerError, nil, "Failed to fetch changes")
 		return
 	}
-	
+
 	var total int
-	db.DB.Get(&total, "SELECT COUNT(*) FROM api_changes WHERE api_id = $1", apiID)
-	
-	response := map[string]interface{}{
+	if err := db.DB.Get(&total, "SELECT COUNT(*) FROM api_changes WHERE api_id=$1", apiID); err != nil {
+		log.Error().Err(err).Msg("Failed to count changes")
+	}
+
+	resp := map[string]interface{}{
 		"changes":    changes,
 		"page":       page,
 		"total":      total,
 		"totalPages": (total + limit - 1) / limit,
 	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+
+	JSONResponse(w, http.StatusOK, resp, "")
 }
 
-// GetDashboardStats - Lightweight dashboard data
+// GetDashboardStats - aggregated stats
 func GetDashboardStats(w http.ResponseWriter, r *http.Request) {
 	userID := getUserFromContext(r.Context())
-	
 	stats := struct {
-		TotalAPIs      int `json:"total_apis"`
-		ActiveAPIs     int `json:"active_apis"`
-		RecentChanges  int `json:"recent_changes"`
-		FailedChecks   int `json:"failed_checks"`
+		TotalAPIs     int `json:"total_apis"`
+		ActiveAPIs    int `json:"active_apis"`
+		RecentChanges int `json:"recent_changes"`
+		FailedChecks  int `json:"failed_checks"`
 	}{}
-	
-	// Use single query with subqueries for efficiency
+
 	query := `
 		SELECT 
-			(SELECT COUNT(*) FROM apis WHERE user_id = $1) as total_apis,
-			(SELECT COUNT(*) FROM apis WHERE user_id = $1 AND is_active = true) as active_apis,
-			(SELECT COUNT(*) FROM api_changes ac 
-			 JOIN apis a ON ac.api_id = a.id 
-			 WHERE a.user_id = $1 AND ac.detected_at > CURRENT_TIMESTAMP - INTERVAL '24 hours') as recent_changes,
-			(SELECT COUNT(*) FROM check_queue cq 
-			 JOIN apis a ON cq.api_id = a.id 
-			 WHERE a.user_id = $1 AND cq.status = 'failed') as failed_checks`
-	
-	db.DB.Get(&stats, query, userID)
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
-}
+			(SELECT COUNT(*) FROM apis WHERE user_id=$1) AS total_apis,
+			(SELECT COUNT(*) FROM apis WHERE user_id=$1 AND is_active=true) AS active_apis,
+			(SELECT COUNT(*) FROM api_changes ac JOIN apis a ON ac.api_id=a.id 
+			 WHERE a.user_id=$1 AND ac.detected_at > CURRENT_TIMESTAMP - INTERVAL '24 hours') AS recent_changes,
+			(SELECT COUNT(*) FROM check_queue cq JOIN apis a ON cq.api_id=a.id 
+			 WHERE a.user_id=$1 AND cq.status='failed') AS failed_checks`
 
-// HealthCheck - Simple health endpoint
-func HealthCheck(w http.ResponseWriter, r *http.Request) {
-	// Check database connection
-	if err := db.DB.Ping(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "unhealthy",
-			"error":  "database unavailable",
-		})
+	if err := db.DB.Get(&stats, query, userID); err != nil {
+		log.Error().Err(err).Msg("Failed to fetch dashboard stats")
+		JSONResponse(w, http.StatusInternalServerError, nil, "Failed to fetch dashboard stats")
 		return
 	}
-	
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+
+	JSONResponse(w, http.StatusOK, stats, "")
+}
+
+// HealthCheck - simple health
+func HealthCheck(w http.ResponseWriter, r *http.Request) {
+	if err := db.DB.Ping(); err != nil {
+		JSONResponse(w, http.StatusServiceUnavailable, nil, "Database unavailable")
+		return
+	}
+	resp := map[string]string{
 		"status": "healthy",
 		"time":   time.Now().Format(time.RFC3339),
-	})
+	}
+	JSONResponse(w, http.StatusOK, resp, "")
+}
+
+// ---------------- Helpers ----------------
+func getUserFromContext(ctx context.Context) int {
+	if uid, ok := ctx.Value("user_id").(int); ok {
+		return uid
+	}
+	return 0
+}
+
+func setUserContext(ctx context.Context, userID int) context.Context {
+	return context.WithValue(ctx, "user_id", userID)
 }
